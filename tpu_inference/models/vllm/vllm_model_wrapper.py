@@ -20,6 +20,7 @@ from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn
@@ -58,7 +59,8 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context, set_vllm_model_wrapper_context)
 from tpu_inference.runner.lora_utils import replace_lora_metadata
-
+from jax.sharding import PartitionSpec as P
+jnp.set_printoptions(threshold=jnp.inf)
 logger = init_logger(__name__)
 
 
@@ -115,6 +117,9 @@ class VllmModelWrapper:
 
         MultiHeadLatentAttentionWrapper.register_oot(
             VllmTPUMultiHeadLatentAttentionWrapper)
+
+        self._running_moe_stats: dict = {}
+        self._step_count: int = 0
 
     def _apply_pp_patch(self):
         # patch `get_pp_group` in vLLM to jax's get_pp_group.
@@ -221,6 +226,7 @@ class VllmModelWrapper:
                 NamedSharding(self.mesh,
                               PartitionSpec(ShardingAxisName.ATTN_DATA, None)),
                 None,  # empty list
+                None,  # moe stats
             ),
             compiler_options={
                 "xla_tpu_all_gather_collective_matmul_mode":
@@ -250,10 +256,102 @@ class VllmModelWrapper:
         ) -> Tuple[List[jax.Array], jax.Array]:
             layer_name_to_kvcache_index = dict(layer_name_to_kvcache_index)
             lora_metadata = torch_view(lora_metadata)
+
+            # PREVIOUS VERSION
+            # Overhead is negligible since query_start_loc length is very small (max_num_seqs + 1).
+            # Calculate unconditionally to properly trigger the log on prefill.
+            # request_distribution is not updated correctly so use query_start_loc instead
+            # query_start_loc = [0,10,15,16,16] meaning 10,5 tokens for the first one(=prefill) and 1 token for the next one(=decode) and 0(=padding) 
+            
+            # Ensure query_start_loc is monotonically increasing to handle zero-padding correctly
+            # [0,1024,0,0,0] -> [0,1024,1024,1024,1024]
+            # [0,4,6,6] -> first request with length 4, second with length 2, remaining padding
+            
+            # [4,2,0]
+            # attn_metadata.query_start_loc.shape[0] = 520
+            jax.debug.print("attn_metadata.query_start_loc.shape[0]: {}", attn_metadata.query_start_loc.shape[0])
+
+            dp_size = self.vllm_config.sharding_config.total_dp_size
+            token_idx = jnp.arange(input_ids.shape[0])
+            # dp_size = 8
+            jax.debug.print("dp_size: {}", dp_size)
+            # input_ids.shape[0] = 16, 32, 64, etc possible
+            jax.debug.print("input_ids.shape[0]: {}", input_ids.shape[0])
+            jax.debug.print("token_idx: {}", token_idx)
+            if dp_size > 1:
+                num_qsl_per_shard = attn_metadata.query_start_loc.shape[0] // dp_size
+                qsl_per_shard = attn_metadata.query_start_loc.reshape(
+                    dp_size, num_qsl_per_shard)
+
+                # Perform local maximum.accumulate on each shard
+                qsl_sorted_per_shard = jax.vmap(
+                    jnp.maximum.accumulate)(qsl_per_shard)
+
+                # Create a robust valid token mask that handles padding holes
+                # between/within shards. The original
+                # `token_idx < query_start_loc_sorted[-1]` is not sufficient
+                # as it only masks padding after the last token of the last
+                # shard.
+                num_tokens_per_shard = input_ids.shape[0] // dp_size
+                # Last element of each row in qsl_sorted_per_shard is the number
+                # of valid tokens in that shard.
+                num_valid_tokens_per_shard = qsl_sorted_per_shard[:, -1]
+                # Map each token to its shard index.
+                # [0,0,0,1,1,1]
+                shard_idx_for_token = token_idx // num_tokens_per_shard
+                # Get the valid token limit for each token's shard.
+                limit_per_token = num_valid_tokens_per_shard[shard_idx_for_token]
+
+                jax.debug.print("num_valid_tokens_per_shard: {}", num_valid_tokens_per_shard)
+                jax.debug.print("limit_per_token: {}", limit_per_token)
+                # Get the token's local index within its shard.
+                local_token_idx = token_idx % num_tokens_per_shard
+                valid_token_mask = local_token_idx < limit_per_token
+                jax.debug.print("valid_token_mask: {}", valid_token_mask)
+
+                # Create global offsets by adding each shard's base token offset
+                num_tokens_per_shard = input_ids.shape[0] // dp_size
+                shard_offsets = (
+                    jnp.arange(dp_size, dtype=jnp.int32) *
+                    num_tokens_per_shard).reshape(-1, 1)
+
+                # Add offsets to make qsl globally monotonic
+                query_start_loc_sorted = (
+                    qsl_sorted_per_shard + shard_offsets).flatten()
+                jax.debug.print("query_start_loc_sorted: {}", query_start_loc_sorted)
+            else:
+                # Original logic for non-DP case
+                query_start_loc_sorted = jnp.maximum.accumulate(
+                    attn_metadata.query_start_loc)
+                valid_token_mask = token_idx < query_start_loc_sorted[-1]
+
+            query_lens = query_start_loc_sorted[1:] - query_start_loc_sorted[:-1]
+            jax.debug.print("query_lens: {}", query_lens)
+            if dp_size > 1:
+                # Zero out query lengths that correspond to padding between shards.
+                # These are incorrectly calculated as large positive numbers due to
+                # the jump in token indices at shard boundaries.
+                boundary_indices = (
+                    jnp.arange(1, dp_size) * num_qsl_per_shard - 1
+                )
+                query_lens = query_lens.at[boundary_indices].set(0)
+            jax.debug.print("query_lens2: {}", query_lens)
+
+            seq_idx = jnp.searchsorted(
+                query_start_loc_sorted, token_idx, side='right') - 1
+            seq_idx = jnp.clip(seq_idx, 0, query_lens.shape[0] - 1)
+            seq_lens_for_tokens = query_lens[seq_idx]
+
+            prefill_mask = (seq_lens_for_tokens > 1) & valid_token_mask
+            decode_mask = (seq_lens_for_tokens == 1) & valid_token_mask
+            jax.debug.print("decode_mask: {}", decode_mask)
+            jax.debug.print("prefill_mask: {}", prefill_mask)
             with torchax.default_env(), set_vllm_model_wrapper_context(
                     kv_caches=kv_caches,
                     mesh=self.mesh,
-                    layer_name_to_kvcache_index=layer_name_to_kvcache_index
+                    layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+                    prefill_mask=prefill_mask,
+                    decode_mask=decode_mask,
             ), set_forward_context(attn_metadata=attn_metadata,
                                    vllm_config=self.vllm_config):
                 # We need to wrap args from jax land into TorchValue with
@@ -277,15 +375,103 @@ class VllmModelWrapper:
                                       self.vllm_config.lora_config)
                 vllm_model_wrapper_context = get_vllm_model_wrapper_context()
                 new_kv_caches = vllm_model_wrapper_context.kv_caches
+                # current step's stats
+                moe_stats = vllm_model_wrapper_context.moe_stats
             # Wrap the output(hidden states or intermediate tensor)
             # from torch land into a JaxValue for the jax code to consume.
             if not is_last_rank:
                 output = JaxIntermediateTensors.from_torch(output_from_torch)
             else:
                 output = jax_view(output_from_torch)
-            return new_kv_caches, output, []
+            return new_kv_caches, output, [], moe_stats
 
-        return step_fun
+        def wrapper(*args, **kwargs):
+            outs = step_fun(*args, **kwargs)
+            moe_stats = outs[-1]
+            
+            if isinstance(moe_stats, dict) and len(moe_stats) > 0:
+                import numpy as onp
+                def process_stats(stats):
+                    return jax.tree_util.tree_map(lambda x: onp.array(x), stats)
+                
+                processed_stats = process_stats(moe_stats)
+
+                # Check if this step only contains padding (e.g., vLLM profiling/warmup runs).
+                # If there are no valid tokens, skip accumulation to prevent polluting the stats.
+                # We only need to check the first layer's stats to determine this.
+                has_valid_tokens = False
+                if processed_stats:
+                    first_layer_stats = next(iter(processed_stats.values()))
+                    cat = "all_valid"
+                    if cat in first_layer_stats and onp.sum(first_layer_stats[cat]["group_sizes"]) > 0:
+                        has_valid_tokens = True
+                
+                if not has_valid_tokens:
+                    return outs[:-1]
+
+                # Accumulate stats
+                for layer, l_stats in processed_stats.items():
+                    if layer not in self._running_moe_stats:
+                        self._running_moe_stats[layer] = {}
+                    for cat in ["prefill", "decode", "all_valid", "all_including_padding"]:
+                        if cat not in l_stats: continue
+                        cat_stats = l_stats[cat]
+
+                        if cat not in self._running_moe_stats[layer]:
+                            self._running_moe_stats[layer][cat] = {
+                                "group_sizes": onp.zeros_like(cat_stats["group_sizes"]),
+                                "affinity_matrix": onp.zeros_like(cat_stats["affinity_matrix"])
+                            }
+
+                        # Running Sum
+                        self._running_moe_stats[layer][cat]["group_sizes"] += cat_stats["group_sizes"]
+                        self._running_moe_stats[layer][cat]["affinity_matrix"] += cat_stats["affinity_matrix"]
+
+
+                import re
+                def extract_layer_num(name):
+                    m = re.search(r'\d+', name)
+                    return int(m.group()) if m else 0
+
+                print("="*50)
+                print("MoE Token Imbalance Profile:")
+                print("Accumulated MoE Token Imbalance Profile:")
+                
+                # Sort layers to print in order
+                sorted_layers = sorted(processed_stats.keys(), key=extract_layer_num)
+
+                # Print to full values without truncation
+                with onp.printoptions(threshold=onp.inf, linewidth=1000):
+                    for layer in sorted_layers:
+                        print(f"Layer: {layer}")
+                        l_stats = processed_stats[layer]
+                        for cat in ["prefill", "decode", "all_valid", "all_including_padding"]:
+                            if cat not in l_stats: continue
+                            cat_stats = l_stats[cat]
+
+                            print(f"  [{cat.upper()}]")
+                            # Current steps' stats
+                            print(f"    --- Current Step ---")
+                            print(f"    Active Experts: {cat_stats['active_experts']}")
+                            print(f"    Max Group Size: {cat_stats['max_group_size']}")
+                            print(f"    Mean Group Size: {float(cat_stats['mean_group_size']):.4f}")
+                            print(f"    Std Group Size: {float(cat_stats['std_group_size']):.4f}")
+                            print(f"    Group Sizes: {cat_stats['group_sizes'].tolist()}")
+                            # print(f"    Affinity Matrix:\n{cat_stats['affinity_matrix']}")
+                
+                print("="*50 + "\n", flush=True)
+                
+                import sys
+                sys.stdout.flush()
+
+                self._step_count += 1
+                if self._step_count % 200 == 0:
+                    self._print_accumulated_moe_stats()
+                    self._step_count = 0 # Reset step count
+
+            return outs[:-1]
+
+        return wrapper
 
     def jit_compute_logits_func(self):
 
@@ -343,6 +529,56 @@ class VllmModelWrapper:
                 return outputs
 
         return compute_pooler_output
+
+    def _print_accumulated_moe_stats(self):
+        if not self._running_moe_stats:
+            return
+            
+        import numpy as onp
+        import re
+        
+        def extract_layer_num(name):
+            m = re.search(r'\d+', name)
+            return int(m.group()) if m else 0
+
+        print("\n" + "="*50)
+        print("Final Accumulated MoE Token Imbalance Profile:")
+        
+        sorted_layers = sorted(self._running_moe_stats.keys(), key=extract_layer_num)
+
+        with onp.printoptions(threshold=onp.inf, linewidth=1000):
+            for layer in sorted_layers:
+                print(f"Layer: {layer}")
+                l_stats = self._running_moe_stats[layer]
+                for cat in ["prefill", "decode", "all_valid", "all_including_padding"]:
+                    if cat not in l_stats: continue
+                    cat_stats = l_stats[cat]
+                    
+                    accumulated_group_sizes = cat_stats["group_sizes"]
+                    total_tokens = onp.sum(accumulated_group_sizes)
+                    if total_tokens == 0: continue
+                    
+                    active_experts = onp.count_nonzero(accumulated_group_sizes)
+                    max_group_size = onp.max(accumulated_group_sizes)
+                    mean_group_size = onp.mean(accumulated_group_sizes)
+                    std_group_size = onp.std(accumulated_group_sizes)
+                    imbalance_ratio = max_group_size / mean_group_size if mean_group_size > 0 else 0.0
+
+                    print(f"  [{cat.upper()}]")
+                    print(f"    --- Accumulated ---")
+                    print(f"    Accumulated Total Tokens: {total_tokens}")
+                    print(f"    Active Experts: {active_experts}")
+                    print(f"    Max Group Size: {max_group_size}")
+                    print(f"    Mean Group Size: {float(mean_group_size):.4f}")
+                    print(f"    Std Group Size: {float(std_group_size):.4f}")
+                    print(f"    Imbalance Ratio (Max/Avg): {float(imbalance_ratio):.4f}")
+                    print(f"    Group Sizes: {accumulated_group_sizes.tolist()}")
+                    print(f"    Affinity Matrix:\n{cat_stats['affinity_matrix']}")
+        
+        print("="*50 + "\n", flush=True)
+        
+        import sys
+        sys.stdout.flush()
 
 
 def load_lora_model(model: torch.nn.Module, vllm_config: VllmConfig,

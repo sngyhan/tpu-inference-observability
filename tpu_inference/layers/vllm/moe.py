@@ -86,4 +86,5 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
             extra_backend_kwargs=quant_method_instance.extra_backend_kwargs,
+            layer_name=quant_method_instance.prefix,
         ))

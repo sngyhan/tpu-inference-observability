@@ -77,14 +77,14 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
                     ignored_layers=self.ignored_layers,
                     fused_mapping=self.packed_modules_mapping,
             ):
-                return VllmUnquantizedLinearMethod(linear_config)
+                return VllmUnquantizedLinearMethod(linear_config, prefix)
             logger.warning_once(
                 "MXFP4 linear layer is not implemented - falling back to "
                 "UnquantizedLinearMethod.")
-            return VllmUnquantizedLinearMethod(linear_config)
+            return VllmUnquantizedLinearMethod(linear_config, prefix)
         elif isinstance(layer, FusedMoE):
             moe_config = self.get_moe_config(layer)
-            return VllmMxfp4MoEMethod(moe_config, self.mesh)
+            return VllmMxfp4MoEMethod(moe_config, self.mesh, prefix)
         elif isinstance(layer, Attention):
             logger.warning_once("MXFP4 attention layer is not implemented. "
                                 "Skipping quantization for this layer.")
@@ -97,12 +97,14 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         self,
         moe: FusedMoEConfig,
         mesh: Mesh,
+        prefix: str,
         ep_axis_name: str = "model",
     ):
         FusedMoEMethodBase.__init__(self, moe)
 
         # We piggyback on triton implementation as it applies minimal hardware
         # specific post processing to the weights.
+        self.prefix = prefix
         self.mxfp4_backend = Mxfp4Backend.TRITON
 
         self.mesh = mesh

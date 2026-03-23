@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import jax
@@ -25,6 +25,9 @@ class VllmModelWrapperContext:
     kv_caches: List[jax.Array]
     mesh: Mesh
     layer_name_to_kvcache_index: Dict[str, int]
+    prefill_mask: Optional[jax.Array] = None
+    decode_mask: Optional[jax.Array] = None
+    moe_stats: Optional[Dict[str, dict]] = field(default_factory=dict)
 
 
 _vllm_model_wrapper_context: Optional[VllmModelWrapperContext] = None
@@ -44,6 +47,8 @@ def set_vllm_model_wrapper_context(
     kv_caches: List[jax.Array],
     mesh: Mesh,
     layer_name_to_kvcache_index: Dict[str, int] = None,
+    prefill_mask=None,
+    decode_mask=None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -51,6 +56,9 @@ def set_vllm_model_wrapper_context(
         kv_caches=kv_caches,
         mesh=mesh,
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+        prefill_mask=prefill_mask,
+        decode_mask=decode_mask,
+        moe_stats={},
     )
 
     try:

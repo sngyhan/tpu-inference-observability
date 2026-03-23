@@ -83,7 +83,7 @@ class VllmAWQConfig(AWQConfig, VllmQuantConfig):
             return VllmAWQLinearMethod(self, linear_config)
         elif isinstance(layer, FusedMoE):
             layer.moe_config = self.get_moe_config(layer)
-            return VllmAWQMoEMethod(self, layer, self.mesh)
+            return VllmAWQMoEMethod(self, layer, self.mesh, prefix)
         return None
 
 
@@ -238,11 +238,13 @@ class VllmAWQMoEMethod(FusedMoEMethodBase):
         quant_config: VllmAWQConfig,
         layer: torch.nn.Module,
         mesh: Mesh,
+        prefix: str,
         ep_axis_name: str = "model",
     ):
         FusedMoEMethodBase.__init__(self, layer.moe_config)
         self.quant_config = quant_config
         self.mesh = mesh
+        self.prefix = prefix
         self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
         self.extra_backend_kwargs = {}
         if self.moe_backend == MoEBackend.FUSED_MOE:

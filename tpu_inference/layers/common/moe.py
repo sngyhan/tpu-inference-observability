@@ -24,6 +24,9 @@ from tpu_inference.kernels.fused_moe.v1.kernel import fused_ep_moe
 from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
 from tpu_inference.logger import init_logger
 
+from tpu_inference.models.vllm.vllm_model_wrapper_context import \
+    get_vllm_model_wrapper_context
+
 if TYPE_CHECKING:
     from tpu_inference.layers.common.process_weights.moe_weights import (
         FusedMoEWeights, UnfusedMoEWeights)
@@ -76,6 +79,7 @@ def moe_apply(
     moe_backend: MoEBackend,
     mesh: Mesh,
     extra_backend_kwargs: dict,
+    layer_name: str,
 ) -> jax.Array:
 
     with jax.named_scope(layer._get_name()):
@@ -121,7 +125,8 @@ def moe_apply(
                     **extra_backend_kwargs,
                 )[:, :actual_hidden_size]
             case MoEBackend.GMM_EP | MoEBackend.GMM_TP:
-                output = fused_moe_func(
+                ctx = get_vllm_model_wrapper_context()
+                temp_output = fused_moe_func(
                     hidden_states=x,
                     w1=weights.w13_weight,
                     w2=weights.w2_weight,
@@ -136,7 +141,12 @@ def moe_apply(
                     use_ep=layer.use_ep,
                     activation=activation,
                     scoring_fn=layer.scoring_func,
+                    layer_name=layer_name,
+                    prefill_mask=ctx.prefill_mask,
+                    decode_mask=ctx.decode_mask,
                 )
+                ctx.moe_stats[layer_name] = temp_output[1]
+                output = temp_output[0]
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance
                 from tpu_inference.layers.jax.moe.dense_moe import \

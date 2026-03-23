@@ -77,10 +77,10 @@ class VllmFp8Config(vllm_fp8.Fp8Config, VllmQuantConfig):
                     ignored_layers=self.ignored_layers,
                     fused_mapping=self.packed_modules_mapping,
             ):
-                return VllmUnquantizedFusedMoEMethod(layer.moe_config)
+                return VllmUnquantizedFusedMoEMethod(layer.moe_config, self.mesh, prefix)
             if self.is_checkpoint_fp8_serialized:
                 layer.moe_config = self.get_moe_config(layer)
-                return VllmFp8MoEMethod(self, layer, self.mesh)
+                return VllmFp8MoEMethod(self, layer, self.mesh, prefix)
             else:
                 raise NotImplementedError(
                     "FP8OnelineMoEMethod is not supported.")
@@ -197,6 +197,7 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
                  quant_config: vllm_fp8.Fp8Config,
                  layer: torch.nn.Module,
                  mesh: Mesh,
+                 prefix: str,
                  ep_axis_name: str = "model"):
         FusedMoEMethodBase.__init__(self, layer.moe_config)
         self.quant_config = quant_config
@@ -207,6 +208,7 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
         self.fp8_backend = None
 
         self.mesh = mesh
+        self.prefix = prefix
         self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
 
         self.extra_backend_kwargs = {}

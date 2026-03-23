@@ -15,6 +15,7 @@
 import functools
 from typing import Literal
 
+import numpy as np
 import jax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
@@ -22,8 +23,40 @@ from jax.sharding import PartitionSpec as P
 
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_mesh_shape_product
 
+logger = init_logger(__name__)
+
+def compute_moe_stats(topk_indices, mask, global_num_experts):
+    # topk_indicies = [[2,0],[1,2],[0,3]]
+    # mask = [true,false,false] 
+    # valid_indices = [[2, 0], [-1,-1], [-1,-1]]
+    valid_indices = jnp.where(mask[:, None], topk_indices, -1)
+    # valid_indices = [[[0,0,1,0], [1,0,0,0]], [[0, 0, 0, 0], [0, 0, 0, 0]], [[0, 0, 0, 0], [0, 0, 0, 0]]]
+    one_hot = jax.nn.one_hot(valid_indices, global_num_experts, dtype=jnp.int32)
+    # multi_hot = [[1,0,1,0], [0,0,0,0], [0,0,0,0]]
+    multi_hot = one_hot.sum(axis=1)
+
+    group_sizes = multi_hot.sum(axis=0)
+    # size = (Experts, experts)
+    affinity = multi_hot.T @ multi_hot
+
+    active_experts = jnp.count_nonzero(group_sizes)
+    max_group_size = jnp.max(group_sizes)
+    mean_group_size = jnp.mean(group_sizes)
+    std_group_size = jnp.std(group_sizes)
+
+    results = {
+        "active_experts": active_experts,
+        "affinity_matrix": affinity,
+        "max_group_size": max_group_size,
+        "mean_group_size": mean_group_size,
+        "std_group_size": std_group_size,
+        "group_sizes": group_sizes
+    }
+
+    return results
 
 def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
     match scoring_fn:
@@ -207,7 +240,7 @@ def expert_parallel_gmm(
     w2: jax.Array,
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
-    group_sizes: jax.Array,
+    group_sizes: jax.Array, # group_sizes[i] indicates number of tokens i-th expert is getting
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
     *,
@@ -272,6 +305,7 @@ def expert_parallel_gmm(
     "use_ep",
     "activation",
     "scoring_fn",
+    "layer_name",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -288,7 +322,10 @@ def fused_moe_func(
     use_ep: bool,
     activation: str,
     scoring_fn: str,
-) -> jax.Array:
+    layer_name: str,
+    prefill_mask: jax.Array | None = None,
+    decode_mask: jax.Array | None = None,
+) -> tuple[jax.Array, dict]:
     """Route tokens in hidden_states into each experts based on routing.
 
     Args:
@@ -324,10 +361,20 @@ def fused_moe_func(
     # All-gather topk weights for attention dp
     topk_weights = jax.lax.with_sharding_constraint(
         topk_weights, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
+    # ex: topk_indicies = [[2,0],[1,2],[0,3]] and [2,0] refers to 2nd and 0th expert for the 0th token
     topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
     topk_weights = topk_weights.astype(dtype)
+
+    all_valid_mask = prefill_mask | decode_mask
+    all_mask = jnp.ones(num_tokens, dtype=bool)
+    stats = {
+        "prefill": compute_moe_stats(topk_indices, prefill_mask, global_num_experts),
+        "decode": compute_moe_stats(topk_indices, decode_mask, global_num_experts),
+        "all_valid": compute_moe_stats(topk_indices, all_valid_mask, global_num_experts),
+        "all_including_padding": compute_moe_stats(topk_indices, all_mask, global_num_experts),
+    }
 
     def _process_tokens_locally(hidden_states_local, topk_indices_local):
         num_tokens_local = hidden_states_local.shape[0]
@@ -336,12 +383,14 @@ def fused_moe_func(
         token_indices = jnp.arange(num_tokens_local,
                                    dtype=jnp.int32).repeat(topk)
         token_indices_sorted = token_indices[topk_argsort_indices]
+        # re-order tokens in the order of experts
         x = hidden_states_local[token_indices_sorted]
         # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
         # length=global_num_experts) but is more performant.
         group_sizes_local = jax.nn.one_hot(topk_indices_flat,
                                            global_num_experts,
                                            dtype=jnp.int32).sum(axis=0)
+        # indices used to collect results for revert process
         topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
 
         return x, group_sizes_local, topk_argsort_revert_indices
@@ -395,4 +444,4 @@ def fused_moe_func(
             mesh=mesh,
         )
 
-    return x[:num_tokens, :hidden_size]
+    return x[:num_tokens, :hidden_size], stats

@@ -85,7 +85,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             return VllmUnquantizedLinearMethod(linear_config)
         if isinstance(layer, FusedMoE):
             moe_config = self.get_moe_config(layer)
-            return VllmUnquantizedFusedMoEMethod(moe_config, self.mesh)
+            return VllmUnquantizedFusedMoEMethod(moe_config, self.mesh, prefix)
         if isinstance(layer, Attention):
             return None
         return None
@@ -209,10 +209,12 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         self,
         moe: FusedMoEConfig,
         mesh: Mesh,
+        prefix: str,
         ep_axis_name: str = "model",
     ):
         super().__init__(moe)
         self.mesh = mesh
+        self.prefix = prefix
         self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
 
         self.extra_backend_kwargs = {}
